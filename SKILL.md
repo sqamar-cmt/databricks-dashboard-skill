@@ -35,6 +35,7 @@ Datasets define SQL queries that power widgets. **Critical rules:**
 - Return all data — NO `WHERE` clauses for filtering (filters are client-side)
 - Every categorical column used in any filter MUST appear in `SELECT` and `GROUP BY`
 - Use human-readable column aliases (see Display Names section)
+- Send `"query"` (single string) when creating; Databricks stores it internally as `"queryLines"` (array of strings). Both formats accepted on update.
 
 ```json
 {
@@ -70,40 +71,45 @@ Datasets define SQL queries that power widgets. **Critical rules:**
 
 ### Grid System
 
-- Grid is **6 columns** wide
-- Position: `{ "x": 0, "y": 0, "width": 3, "height": 4 }`
+- **REST API (`POST/PATCH /api/2.0/lakeview/dashboards`):** Grid is **12 columns** wide
+- **`.lvdash.json` file format:** Grid is **6 columns** wide
+- Position: `{ "x": 0, "y": 0, "width": 6, "height": 4 }`
+- Height is in grid units
 
 ### Consistent Sizing Rules
 
 **Same-type charts in a row MUST have equal dimensions:**
 
+For 6-column grid (.lvdash.json):
 ```
 Row of 2 charts:  width=3, height=4 each
 Row of 3 charts:  width=2, height=4 each
 Full-width chart: width=6, height=4
 ```
 
+For 12-column grid (REST API):
+```
+Row of 2 charts:  width=6, height=5 each
+Row of 3 charts:  width=4, height=5 each
+Row of 6 charts:  width=2, height=8 each
+Full-width chart: width=12, height=6
+```
+
 **Counter metrics row:** Counters get equal small widths, filling the row evenly:
 
 ```
-4 counters: width=1.5 each (but use width=1 with padding or width=2 for 3 counters)
-3 counters: width=2 each
-2 counters: width=3 each
-```
-
-**Mixed rows (counters + chart):** Size counters minimally, give remaining width to the chart:
-
-```
-2 counters (width=1 each) + 1 chart (width=4, height=4)
+4 counters (6-col): width=1.5 each
+4 counters (12-col): width=3 each
+3 counters: width=2 (6-col) or width=4 (12-col)
 ```
 
 **Height consistency:** All charts in the same row use the same height. Standard heights:
 - Counters: `height=2`
-- Charts: `height=4`
+- Charts: `height=4` to `height=8` (taller for narrow charts)
 - Tables: `height=5` or `height=6`
 - Filters row: `height=1`
 
-### Layout Template
+### Layout Template (6-column grid)
 
 ```
 y=0:  Filter widgets row (height=1)
@@ -132,6 +138,8 @@ y=11: Table (height=5)
 
 ## Chart Widget Template
 
+**CRITICAL: The `y` encoding MUST use `"fields"` (array), NOT `"fieldName"` (string).** Using `"fieldName"` for `y` will render "No data" or an empty chart.
+
 ```json
 {
   "position": { "x": 0, "y": 3, "width": 3, "height": 4 },
@@ -142,7 +150,7 @@ y=11: Table (height=5)
         "name": "main_query",
         "query": {
           "datasetName": "a1b2c3d4",
-          "disaggregated": false,
+          "disaggregated": true,
           "fields": [
             { "expression": "`order_month`", "name": "order_month" },
             { "expression": "`total_revenue`", "name": "total_revenue" }
@@ -159,12 +167,100 @@ y=11: Table (height=5)
       },
       "encodings": {
         "x": { "displayName": "Month", "fieldName": "order_month", "scale": { "type": "temporal" } },
-        "y": { "displayName": "Total Revenue (USD)", "fieldName": "total_revenue", "scale": { "type": "quantitative" } }
+        "y": {
+          "fields": [
+            { "fieldName": "total_revenue", "displayName": "Total Revenue (USD)" }
+          ],
+          "scale": { "type": "quantitative" }
+        }
       }
     }
   }
 }
 ```
+
+## Multi-Line Charts
+
+There are TWO approaches for showing multiple lines. Choose the right one:
+
+### Approach 1: Multiple Y-Fields (PREFERRED for related metrics)
+
+Use when plotting two related metrics from the same dataset (e.g., current value vs baseline, actual vs forecast, scored % vs rolling average). Each field becomes a separate line. **NO color encoding needed.**
+
+**Dataset:** Return separate columns for each line.
+
+```sql
+SELECT metric_date,
+       ROUND(value, 2) AS current_value,
+       ROUND(rolling_14d_avg, 2) AS baseline
+FROM baselines_table
+WHERE metric_date >= CURRENT_DATE - INTERVAL 30 DAYS
+ORDER BY metric_date
+```
+
+**Widget:** List multiple fields in the `y.fields` array. All fields must also appear in `query.fields`.
+
+```json
+{
+  "queries": [{
+    "name": "main_query",
+    "query": {
+      "datasetName": "ds_baseline",
+      "fields": [
+        { "name": "metric_date", "expression": "`metric_date`" },
+        { "name": "current_value", "expression": "`current_value`" },
+        { "name": "baseline", "expression": "`baseline`" }
+      ],
+      "disaggregated": true
+    }
+  }],
+  "spec": {
+    "version": 3,
+    "widgetType": "line",
+    "encodings": {
+      "x": { "fieldName": "metric_date", "scale": { "type": "temporal" }, "displayName": "Date" },
+      "y": {
+        "fields": [
+          { "fieldName": "current_value", "displayName": "Current" },
+          { "fieldName": "baseline", "displayName": "Baseline (14d avg)" }
+        ],
+        "scale": { "type": "quantitative" }
+      }
+    },
+    "frame": { "showTitle": true, "title": "Current vs Baseline" }
+  }
+}
+```
+
+### Approach 2: Color Encoding (for categorical splits)
+
+Use when data has a category column (e.g., iOS vs Android, region A vs B). Dataset uses GROUP BY or UNION ALL to create rows per category.
+
+```json
+{
+  "encodings": {
+    "x": { "fieldName": "date", "scale": { "type": "temporal" } },
+    "y": {
+      "fields": [{ "fieldName": "value", "displayName": "Value" }],
+      "scale": { "type": "quantitative" }
+    },
+    "color": {
+      "fieldName": "platform",
+      "scale": { "type": "categorical" },
+      "displayName": "Platform"
+    }
+  }
+}
+```
+
+Add the color field to `query.fields`:
+```json
+{ "name": "platform", "expression": "`platform`" }
+```
+
+### WARNING: DO NOT use UNION ALL + color encoding for current vs baseline
+
+Using `UNION ALL` to combine current and baseline into rows with a `series` column (e.g., series='Current' / series='Baseline') does **NOT** work in Lakeview. One series renders correctly but the other appears as a flat line or doesn't render at all. **Always use Approach 1 (multiple y-fields)** for plotting two related metrics from the same dataset.
 
 ## Forecast Charts
 
@@ -187,8 +283,7 @@ For forecast data with actual vs. predicted values and confidence intervals, use
         "scale": { "type": "temporal" }
       },
       "y": {
-        "displayName": "Revenue (USD)",
-        "fieldName": "actual_value",
+        "fields": [{ "fieldName": "actual_value", "displayName": "Revenue (USD)" }],
         "scale": { "type": "quantitative" }
       },
       "yForecast": {
@@ -340,6 +435,10 @@ For filters to work across multiple charts using different datasets:
 
 ## Table Widget
 
+**WARNING: Table widgets created via the REST API frequently show "Visualization has no fields selected" even with correct format. This is a known Lakeview bug (tested with 9+ format variants including v1/v3, typed/untyped columns, queryLines, empty encodings — ALL fail). Tables work reliably only when created manually through the dashboard "Edit draft" UI.**
+
+If you must include tables via API, use version 1 with full column properties:
+
 ```json
 {
   "spec": {
@@ -351,32 +450,41 @@ For filters to work across multiple charts using different datasets:
         {
           "fieldName": "region",
           "title": "Region",
+          "displayName": "Region",
           "type": "string",
           "displayAs": "string",
           "visible": true,
           "order": 0,
           "alignContent": "left",
+          "allowHTML": false,
+          "allowSearch": false,
+          "highlightLinks": false,
+          "useMonospaceFont": false,
+          "preserveWhitespace": false,
           "booleanValues": ["false", "true"],
+          "linkOpenInNewTab": true,
           "imageUrlTemplate": "{{ @ }}",
           "imageTitleTemplate": "{{ @ }}",
           "imageWidth": "",
           "imageHeight": "",
           "linkUrlTemplate": "{{ @ }}",
           "linkTextTemplate": "{{ @ }}",
-          "linkTitleTemplate": "{{ @ }}",
-          "linkOpenInNewTab": true,
-          "numberFormat": ""
+          "linkTitleTemplate": "{{ @ }}"
         }
       ]
     },
-    "invisibleColumns": [],
     "allowHTMLByDefault": false,
-    "paginationSize": 25
+    "itemsPerPage": 25,
+    "paginationSize": "default",
+    "condensed": true,
+    "withRowNumber": false
   }
 }
 ```
 
 Set `disaggregated: true` in the query for tables.
+
+**Recommended workaround:** Replace API-deployed tables with bar charts, counters, or text widgets showing the SQL query. Add tables manually through the UI after deployment.
 
 ## Widget Field Expressions
 
@@ -393,6 +501,9 @@ Common causes and fixes:
 |-------|-----|
 | Parameter-based filters | Switch to field-based filters (see above) |
 | Empty parameter value | Remove parameters entirely |
+| Line chart `y` uses `fieldName` | MUST use `y.fields` array, not `y.fieldName` |
+| UNION ALL for current vs baseline | Use multiple y-fields instead (see Multi-Line Charts) |
+| Table via REST API | Known bug — add tables manually via Edit draft UI |
 | Field name mismatch | Ensure widget field names exactly match dataset column aliases |
 | Missing field in dataset | Add the column to dataset `SELECT` and `GROUP BY` |
 | Complex widget expression | Move logic to dataset SQL, reference simple column in widget |
@@ -400,7 +511,46 @@ Common causes and fixes:
 
 ## Deployment
 
-### Option 1: Lakeview API
+### Option 1: REST API (PATCH existing dashboard)
+
+**CRITICAL:** After PATCH, you MUST re-publish. The dashboard won't update for viewers until published.
+
+```python
+import json, os, urllib.request
+
+# In Databricks job context, ctx.apiToken() throws NoSuchElementException.
+# Use environment variable instead:
+token = os.environ.get("DATABRICKS_TOKEN")
+host = spark.conf.get("spark.databricks.workspaceUrl", "your-workspace.cloud.databricks.com")
+
+dashboard_config = json.dumps({"datasets": datasets, "pages": pages})
+payload = json.dumps({
+    "display_name": "My Dashboard",
+    "warehouse_id": "your_warehouse_id",
+    "serialized_dashboard": dashboard_config
+}).encode()
+
+# PATCH (update existing)
+req = urllib.request.Request(
+    f"https://{host}/api/2.0/lakeview/dashboards/{dashboard_id}",
+    data=payload, method="PATCH",
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+)
+resp = urllib.request.urlopen(req)
+
+# MUST re-publish after PATCH
+pub_payload = json.dumps({"warehouse_id": "your_warehouse_id", "embed_credentials": True}).encode()
+pub_req = urllib.request.Request(
+    f"https://{host}/api/2.0/lakeview/dashboards/{dashboard_id}/published",
+    data=pub_payload, method="POST",
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+)
+urllib.request.urlopen(pub_req)
+```
+
+**Note:** Use `urllib.request` instead of `requests` library — `requests` may fail in Databricks job context.
+
+### Option 2: Lakeview SDK
 
 ```python
 from databricks.sdk import WorkspaceClient
@@ -424,7 +574,7 @@ w.lakeview.publish(
 )
 ```
 
-### Option 2: Workspace Import
+### Option 3: Workspace Import
 
 ```python
 import base64, json
@@ -438,7 +588,7 @@ w.workspace.import_(
 )
 ```
 
-### Option 3: Databricks Asset Bundles
+### Option 4: Databricks Asset Bundles
 
 ```yaml
 resources:
@@ -455,6 +605,9 @@ Deploy with `databricks bundle deploy`.
 
 | Mistake | Fix |
 |---------|-----|
+| Using `y.fieldName` instead of `y.fields` array | Line/bar/area charts MUST use `y: { "fields": [...], "scale": {...} }` |
+| UNION ALL + color for current vs baseline | Use multiple y-fields approach instead — UNION ALL renders one series as flat line |
+| Table widgets via REST API | Known rendering bug — add tables via Edit draft UI instead |
 | Using raw column names as labels | Always use human-readable display names with units |
 | Plotting forecast as separate series | Use forecast encodings (`yForecast`, `yForecastLower`, `yForecastUpper`) |
 | Inconsistent chart sizes in a row | All charts in the same row must have equal width and height |
@@ -464,3 +617,6 @@ Deploy with `databricks bundle deploy`.
 | `CASE WHEN` in widget expression | Move complex logic to dataset SQL |
 | Missing `disaggregated: true` on table | Set in the query object for table widgets |
 | Forgetting filter field in GROUP BY | Every filter field must be in SELECT and GROUP BY |
+| Not re-publishing after PATCH | MUST `POST /lakeview/dashboards/{id}/published` after every PATCH |
+| Using `ctx.apiToken()` in jobs | Throws `NoSuchElementException` — use `os.environ.get("DATABRICKS_TOKEN")` |
+| Using `requests` library in jobs | May fail — use `urllib.request` for HTTP calls in job-context notebooks |
